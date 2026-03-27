@@ -1,0 +1,50 @@
+# Agent Online RL — verl SFT LoRA 训练配置
+#
+# 使用方式（通过 train_batch_lora.py 自动调用，无需手动运行）：
+#   torchrun --nproc_per_node=N -m verl.trainer.sft_trainer_engine \
+#     --config-path config --config-name ppo_lora_trainer \
+#     model.path=<base_model> \
+#     data.train_files=<parquet> \
+#     trainer.default_local_dir=<output_dir> \
+#     [model.lora_adapter_path=<existing_lora>]
+
+defaults:
+  - model@model: hf_model
+  - engine@engine: fsdp
+  - optim@optim: fsdp
+  - _self_
+
+# ---- 数据 ----
+data:
+  train_files: ???          # 运行时注入（Parquet 路径）
+  val_files: null
+  train_batch_size: 32
+  micro_batch_size_per_gpu: 4
+  max_length: 2048
+  truncation: right
+  pad_mode: right
+
+# ---- 模型 + LoRA ----
+model:
+  path: ???                 # 运行时注入（基础模型路径）
+  freeze_base: true         # 基础模型参数全部冻结，仅训练 LoRA
+  lora_rank: 16
+  lora_alpha: 32
+  target_modules: all-linear
+  lora_dropout: 0.05
+  lora_adapter_path: null   # 运行时注入（增量训练时覆盖）
+  use_remove_padding: false
+
+# ---- 训练器 ----
+trainer:
+  total_epochs: 3
+  default_local_dir: ???    # 运行时注入（输出目录）
+  save_freq: -1             # 仅在训练结束时保存一次
+  test_freq: -1             # 不做中间验证
+
+# ---- FSDP 引擎 ----
+engine:
+  strategy: fsdp
+  dtype: bfloat16
+  param_offload: false
+  optimizer_offload: false

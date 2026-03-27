@@ -1,0 +1,20 @@
+# Agent Online RL — 依赖清单
+
+# Gateway
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+httpx>=0.27.0
+pydantic>=2.0.0
+
+# 数据存储
+pandas>=2.0.0
+pyarrow>=14.0.0      # Parquet 支持
+
+# 训练（verl 已包含大部分，此处仅补充缺失项）
+torch>=2.1.0
+transformers>=4.40.0
+peft>=0.10.0
+
+# 测试
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
