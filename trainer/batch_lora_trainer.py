@@ -11,6 +11,7 @@ BatchUserLoRATrainer — 基础模型只加载一次，顺序为多个用户训�
 容错：单用户失败不影响后续用户，失败轨迹回滚为 FAILED。
 """
 
+import json
 import logging
 import os
 import shutil
@@ -27,6 +28,118 @@ from storage.trajectory_store import TrajectoryStore
 from trainer.trajectory_dataset import trajectories_to_parquet
 
 logger = logging.getLogger(__name__)
+
+
+def _find_latest_checkpoint(output_dir: str) -> Path:
+    """Locate the latest global_step_* checkpoint written by verl."""
+    output_path = Path(output_dir)
+    tracker = output_path / "latest_checkpointed_iteration.txt"
+    if tracker.exists():
+        step = tracker.read_text().strip()
+        ckpt = output_path / f"global_step_{step}"
+        if ckpt.exists():
+            return ckpt
+    candidates = sorted(output_path.glob("global_step_*"), key=lambda p: int(p.name.split("_")[-1]))
+    if not candidates:
+        raise FileNotFoundError(f"No checkpoint found in {output_dir}")
+    return candidates[-1]
+
+
+def _convert_fsdp_to_peft(ckpt_dir: Path, base_model: str, lora_output_dir: str) -> str:
+    """Convert verl FSDP sharded checkpoint to standard PEFT LoRA adapter format.
+
+    Returns the path to the directory containing the PEFT adapter.
+    """
+    import torch
+
+    fsdp_config_path = ckpt_dir / "fsdp_config.json"
+    if not fsdp_config_path.exists():
+        raise FileNotFoundError(f"fsdp_config.json not found in {ckpt_dir}")
+
+    with open(fsdp_config_path) as f:
+        fsdp_cfg = json.load(f)
+    world_size = fsdp_cfg["world_size"]
+
+    lora_meta_path = ckpt_dir / "lora_train_meta.json"
+    if lora_meta_path.exists():
+        with open(lora_meta_path) as f:
+            lora_meta = json.load(f)
+    else:
+        lora_meta = {"r": 16, "lora_alpha": 32, "task_type": "CAUSAL_LM"}
+
+    logger.info("Loading and merging %d FSDP shards from %s ...", world_size, ckpt_dir)
+    state_dicts = []
+    for rank in range(world_size):
+        shard_path = ckpt_dir / f"model_world_size_{world_size}_rank_{rank}.pt"
+        sd = torch.load(shard_path, map_location="cpu", weights_only=False)
+        state_dicts.append(sd)
+
+    merged: dict[str, torch.Tensor] = {}
+    for key in state_dicts[0]:
+        tensors = []
+        for sd in state_dicts:
+            t = sd[key]
+            try:
+                from torch.distributed._tensor import DTensor
+            except ImportError:
+                DTensor = None
+            if DTensor is not None and isinstance(t, DTensor):
+                t = t._local_tensor
+            tensors.append(t)
+        if tensors[0].shape == tensors[-1].shape and torch.equal(tensors[0], tensors[-1]):
+            merged[key] = tensors[0]
+        else:
+            try:
+                merged[key] = torch.cat(tensors, dim=0)
+            except RuntimeError:
+                merged[key] = tensors[0]
+
+    lora_state_dict = {}
+    prefix_map = {
+        "base_model.model.": "",
+    }
+    for key, value in merged.items():
+        if "lora_" not in key:
+            continue
+        clean_key = key
+        for old_prefix, new_prefix in prefix_map.items():
+            if clean_key.startswith(old_prefix):
+                clean_key = new_prefix + clean_key[len(old_prefix):]
+                break
+        lora_state_dict[clean_key] = value
+
+    if not lora_state_dict:
+        logger.warning("No LoRA parameters found in checkpoint; publishing raw FSDP checkpoint")
+        return str(ckpt_dir)
+
+    out = Path(lora_output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    from safetensors.torch import save_file
+    save_file(lora_state_dict, str(out / "adapter_model.safetensors"))
+
+    adapter_config = {
+        "base_model_name_or_path": base_model.rstrip("/"),
+        "bias": "none",
+        "fan_in_fan_out": False,
+        "inference_mode": True,
+        "init_lora_weights": True,
+        "lora_alpha": lora_meta.get("lora_alpha", 32),
+        "lora_dropout": 0.0,
+        "modules_to_save": None,
+        "peft_type": "LORA",
+        "r": lora_meta.get("r", 16),
+        "revision": None,
+        "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj",
+                           "gate_proj", "up_proj", "down_proj"],
+        "task_type": lora_meta.get("task_type", "CAUSAL_LM"),
+    }
+    with open(out / "adapter_config.json", "w") as f:
+        json.dump(adapter_config, f, indent=2)
+
+    logger.info("Converted FSDP checkpoint to PEFT LoRA adapter at %s (%d params)",
+                out, len(lora_state_dict))
+    return str(out)
 
 
 def run_verl_lora_sft(
@@ -49,6 +162,7 @@ def run_verl_lora_sft(
         nproc_per_node:    每节点 GPU 数量
         extra_overrides:   额外 Hydra 配置覆盖项
     """
+    base_model = base_model.rstrip("/")
     overrides = [
         f"model.path={base_model}",
         f"data.train_files={train_parquet}",
@@ -62,7 +176,7 @@ def run_verl_lora_sft(
     cmd = [
         "torchrun",
         f"--nproc_per_node={nproc_per_node}",
-        "-m", "verl.trainer.sft_trainer_engine",
+        "-m", "verl.trainer.sft_trainer",
         f"--config-path={Path(config_path).parent}",
         f"--config-name={Path(config_path).stem}",
     ] + overrides
@@ -103,15 +217,22 @@ class BatchUserLoRATrainer:
         self.nproc_per_node = nproc_per_node or _detect_gpu_count()
         self.tmp_root = tmp_root
 
-    def run(self, user_batch: list[UserTrainingJob]) -> None:
-        """顺序训练 user_batch 中的每个用户，单用户失败不影响其他用户。"""
+    def run(self, user_batch: list[UserTrainingJob]) -> int:
+        """顺序训练 user_batch 中的每个用户，单用户失败不影响其他用户。
+
+        Returns:
+            Number of users that failed training. 0 means all succeeded.
+        """
         logger.info("Starting batch training for %d users", len(user_batch))
+        failures = 0
         for job in user_batch:
             try:
                 self._train_one_user(job)
             except Exception:
                 logger.exception("Training failed for user %s", job.user_id)
                 self.store.mark_failed(job.trajectory_ids)
+                failures += 1
+        return failures
 
     def _train_one_user(self, job: UserTrainingJob) -> None:
         """完整训练单个用户的 LoRA 并发布。"""
@@ -148,21 +269,26 @@ class BatchUserLoRATrainer:
             logger.info("Fresh LoRA init for user %s", job.user_id)
 
         # 3. 训练
-        output_dir = str(run_dir / "output")
+        verl_output_dir = str(run_dir / "verl_output")
         run_verl_lora_sft(
             base_model=self.base_model_path,
             train_parquet=parquet_path,
-            output_dir=output_dir,
+            output_dir=verl_output_dir,
             config_path=self.verl_config_path,
             lora_adapter_path=lora_adapter_path,
             nproc_per_node=self.nproc_per_node,
         )
 
+        # 3.5 Convert FSDP checkpoint to PEFT LoRA adapter format for vLLM hot-loading
+        ckpt_dir = _find_latest_checkpoint(verl_output_dir)
+        peft_dir = str(run_dir / "peft_adapter")
+        _convert_fsdp_to_peft(ckpt_dir, self.base_model_path, peft_dir)
+
         # 4. 发布 LoRA 到仓库
         reward_avg = sum(t.reward for t in trajectories) / len(trajectories)
         lora_version = self.lora_repo.publish(
             user_id=job.user_id,
-            lora_path=output_dir,
+            lora_path=peft_dir,
             metadata={
                 "trajectory_count": len(trajectories),
                 "reward_avg": reward_avg,

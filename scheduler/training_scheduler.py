@@ -2,21 +2,30 @@
 TrainingScheduler — 定时扫描 + 批量触发 LoRA 训练。
 
 每 scan_interval_seconds（默认 10 分钟）扫描一次：
-  1. 找出所有 pending_count >= threshold 的用户
-  2. 原子获取这批轨迹并标记为 TRAINING
-  3. 提交单次批量训练任务（多用户共享同一集群启动成本）
+  1. 检查之前提交的训练任务是否已完成/失败，回退失败的轨迹为 pending
+  2. 找出所有 pending_count >= threshold 的用户
+  3. 原子获取这批轨迹并标记为 TRAINING
+  4. 提交单次批量训练任务（多用户共享同一集群启动成本）
 """
 
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from typing import Optional
 
 from scheduler.resource_scheduler import ResourceScheduler
-from storage.models import UserTrainingJob
+from storage.models import JobStatus, UserTrainingJob
 from storage.trajectory_store import TrajectoryStore
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _ActiveJob:
+    """Tracks a submitted training job so we can monitor it."""
+    job_id: str
+    user_jobs: list[UserTrainingJob]
 
 
 class TrainingScheduler:
@@ -33,6 +42,7 @@ class TrainingScheduler:
         self.scan_interval_seconds = scan_interval_seconds
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._active_jobs: list[_ActiveJob] = []
 
     def start(self) -> None:
         """启动后台扫描线程（daemon，进程退出时自动终止）。"""
@@ -57,10 +67,38 @@ class TrainingScheduler:
     def _scan_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
+                self._check_active_jobs()
                 self._scan_once()
             except Exception:
                 logger.exception("Error during training scheduler scan")
             self._stop_event.wait(self.scan_interval_seconds)
+
+    def _check_active_jobs(self) -> None:
+        """Check previously submitted jobs; roll back trajectories on failure, clean up on success."""
+        still_active: list[_ActiveJob] = []
+        for active in self._active_jobs:
+            try:
+                status = self.resource_scheduler.get_job_status(active.job_id)
+            except KeyError:
+                logger.warning("Job %s no longer tracked by scheduler, assuming failed", active.job_id)
+                status = JobStatus.FAILED
+
+            if status == JobStatus.RUNNING:
+                still_active.append(active)
+                continue
+
+            all_ids = [tid for j in active.user_jobs for tid in j.trajectory_ids]
+            if status == JobStatus.COMPLETED:
+                logger.info("Training job %s completed (%d trajectories)", active.job_id, len(all_ids))
+                self.store.mark_trained(all_ids)
+            else:
+                logger.warning(
+                    "Training job %s failed — resetting %d trajectories to pending for retry",
+                    active.job_id, len(all_ids),
+                )
+                self.store.reset_to_pending(all_ids)
+
+        self._active_jobs = still_active
 
     def _scan_once(self) -> Optional[str]:
         """执行一次扫描，若有满足条件的用户则提交批量训练任务，返回 job_id 或 None。"""
@@ -82,7 +120,6 @@ class TrainingScheduler:
                 logger.debug("Queued %d trajectories for user %s", len(trajectories), user_id)
 
         if not user_jobs:
-            # 极少发生：race condition 下其他进程已抢先处理
             return None
 
         try:
@@ -93,10 +130,10 @@ class TrainingScheduler:
                 len(user_jobs),
                 sum(len(j.trajectory_ids) for j in user_jobs),
             )
+            self._active_jobs.append(_ActiveJob(job_id=job_id, user_jobs=user_jobs))
             return job_id
         except Exception:
-            # 提交失败：将已标记为 TRAINING 的轨迹回滚为 FAILED，等待下次重试
-            logger.exception("Failed to submit batch training job, marking trajectories as failed")
+            logger.exception("Failed to submit batch training job, resetting trajectories to pending")
             for job in user_jobs:
-                self.store.mark_failed(job.trajectory_ids)
+                self.store.reset_to_pending(job.trajectory_ids)
             return None

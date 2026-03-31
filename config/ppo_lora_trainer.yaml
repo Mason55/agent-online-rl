@@ -1,7 +1,7 @@
 # Agent Online RL — verl SFT LoRA 训练配置
 #
 # 使用方式（通过 train_batch_lora.py 自动调用，无需手动运行）：
-#   torchrun --nproc_per_node=N -m verl.trainer.sft_trainer_engine \
+#   torchrun --nproc_per_node=N -m verl.trainer.sft_trainer \
 #     --config-path config --config-name ppo_lora_trainer \
 #     model.path=<base_model> \
 #     data.train_files=<parquet> \
@@ -9,42 +9,181 @@
 #     [model.lora_adapter_path=<existing_lora>]
 
 defaults:
-  - model@model: hf_model
-  - engine@engine: fsdp
-  - optim@optim: fsdp
   - _self_
 
 # ---- 数据 ----
 data:
-  train_files: ???          # 运行时注入（Parquet 路径）
+  train_files: ???
   val_files: null
-  train_batch_size: 32
-  micro_batch_size_per_gpu: 4
+  train_batch_size: 4
+  micro_batch_size_per_gpu: 2
+  max_token_len_per_gpu: 8192
+  use_dynamic_bsz: false
   max_length: 2048
   truncation: right
-  pad_mode: right
+  pad_mode: no_padding
+  messages_key: messages
+  tools_key: tools
+  enable_thinking_key: enable_thinking
+  enable_thinking_default: none
+  balance_dp_token: false
+  custom_cls:
+    path: null
+    name: null
+  use_shm: false
+  train_max_samples: -1
+  val_max_samples: -1
+  apply_chat_template_kwargs: {}
+  num_workers: 4
+  ignore_input_ids_mismatch: true
 
-# ---- 模型 + LoRA ----
+# ---- 模型 + LoRA (inline hf_model config) ----
 model:
-  path: ???                 # 运行时注入（基础模型路径）
-  freeze_base: true         # 基础模型参数全部冻结，仅训练 LoRA
+  _target_: verl.workers.config.HFModelConfig
+  path: ???
+  hf_config_path: null
+  tokenizer_path: null
+  use_shm: false
+  trust_remote_code: false
+  custom_chat_template: null
+  external_lib: null
+  override_config: {}
+  enable_gradient_checkpointing: true
+  enable_activation_offload: false
+  use_remove_padding: false
   lora_rank: 16
   lora_alpha: 32
   target_modules: all-linear
-  lora_dropout: 0.05
-  lora_adapter_path: null   # 运行时注入（增量训练时覆盖）
-  use_remove_padding: false
+  exclude_modules: null
+  lora_adapter_path: null
+  use_liger: false
+  use_fused_kernels: false
+  fused_kernel_options:
+    impl_backend: torch
+  tiled_mlp:
+    enabled: false
+    num_shards: 4
+  mtp:
+    _target_: verl.workers.config.MtpConfig
+    enable: false
+    enable_train: false
+    enable_rollout: false
+    detach_encoder: false
+    mtp_loss_scaling_factor: 0.1
+    speculative_algorithm: EAGLE
+    speculative_num_steps: 3
+    speculative_eagle_topk: 1
+    speculative_num_draft_tokens: 4
+    method: mtp
+    num_speculative_tokens: 1
+
+# ---- FSDP Engine (inline) ----
+engine:
+  _target_: verl.workers.config.FSDPEngineConfig
+  wrap_policy:
+    min_num_params: 0
+  param_offload: false
+  optimizer_offload: false
+  offload_policy: false
+  reshard_after_forward: true
+  fsdp_size: -1
+  forward_prefetch: false
+  model_dtype: fp32
+  use_orig_params: false
+  seed: 42
+  full_determinism: false
+  ulysses_sequence_parallel_size: 1
+  entropy_from_logits_with_chunking: false
+  use_torch_compile: false
+  entropy_checkpointing: false
+  forward_only: false
+  strategy: fsdp
+  dtype: bfloat16
+  qat:
+    _target_: verl.workers.config.QATEngineConfig
+    enable: false
+    mode: w4a16
+    group_size: 16
+    ignore_patterns:
+      - lm_head
+      - embed_tokens
+      - "re:.*mlp.gate$"
+    activation_observer: static_minmax
+    quantization_config_path: null
+
+# ---- FSDP Optimizer (inline) ----
+optim:
+  _target_: verl.workers.config.FSDPOptimizerConfig
+  optimizer: AdamW
+  optimizer_impl: torch.optim
+  lr: 5e-5
+  lr_warmup_steps_ratio: 0.1
+  total_training_steps: -1
+  weight_decay: 0.01
+  lr_warmup_steps: -1
+  betas: [0.9, 0.999]
+  clip_grad: 1.0
+  min_lr_ratio: 0.0
+  num_cycles: 0.5
+  lr_scheduler_type: cosine
+  zero_indexed_step: true
+  warmup_style: null
+  override_optimizer_config: null
+
+# ---- Checkpoint ----
+checkpoint:
+  _target_: verl.trainer.config.CheckpointConfig
+  save_contents: ["model"]
+  load_contents: ["model"]
+  mbridge_config: {}
+
+# ---- Profiler ----
+profiler:
+  _target_: verl.utils.profiler.ProfilerConfig
+  tool: torch
+  enable: false
+  all_ranks: false
+  ranks: []
+  save_path: outputs/profile
+  tool_config:
+    npu:
+      _target_: verl.utils.profiler.config.NPUToolConfig
+      contents: []
+      level: level0
+      analysis: true
+      discrete: false
+      name: npu
+    nsys:
+      _target_: verl.utils.profiler.config.NsightToolConfig
+      discrete: false
+      name: nsight
+    torch:
+      _target_: verl.utils.profiler.config.TorchProfilerToolConfig
+      contents: []
+      discrete: false
+      name: torch
+    torch_memory:
+      _target_: verl.utils.profiler.config.TorchMemoryToolConfig
+      trace_alloc_max_entries: 100000
+      stack_depth: 32
+      name: torch_memory
 
 # ---- 训练器 ----
 trainer:
   total_epochs: 3
-  default_local_dir: ???    # 运行时注入（输出目录）
-  save_freq: -1             # 仅在训练结束时保存一次
-  test_freq: -1             # 不做中间验证
-
-# ---- FSDP 引擎 ----
-engine:
-  strategy: fsdp
-  dtype: bfloat16
-  param_offload: false
-  optimizer_offload: false
+  total_training_steps: null
+  default_local_dir: ???
+  default_hdfs_dir: null
+  save_freq: -1
+  test_freq: -1
+  max_ckpt_to_keep: 1
+  logger: ['console']
+  seed: 42
+  resume_mode: disable
+  resume_from_path: null
+  device: cuda
+  nnodes: 1
+  n_gpus_per_node: 1
+  project_name: agent-online-rl
+  experiment_name: sft-lora
+  profile_interval: [-1, -1]

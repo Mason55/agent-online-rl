@@ -76,8 +76,11 @@ def main():
         nproc_per_node=args.nproc_per_node,
         tmp_root=args.tmp_root,
     )
-    trainer.run(user_jobs)
-    logger.info("Batch LoRA training completed")
+    failures = trainer.run(user_jobs)
+    if failures:
+        logger.error("Batch LoRA training finished with %d/%d user failures", failures, len(user_jobs))
+        sys.exit(1)
+    logger.info("Batch LoRA training completed successfully")
 
 
 if __name__ == "__main__":

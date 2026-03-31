@@ -86,6 +86,10 @@ class TrajectoryStore:
         """原子操作：获取 PENDING 轨迹并标记为 TRAINING"""
         with self._lock:
             with self._conn() as conn:
+                # limit controls the maximum number of pending trajectories consumed
+                # for this user in a single scheduling round.
+                # TODO(lmy): Add an explicit ORDER BY (for example created_at ASC)
+                # so LIMIT picks a deterministic subset instead of an unspecified one.
                 rows = conn.execute("""
                     SELECT * FROM trajectories
                     WHERE user_id=? AND status=?
@@ -111,6 +115,10 @@ class TrajectoryStore:
 
     def mark_failed(self, trajectory_ids: list[str]) -> None:
         self._update_status(trajectory_ids, TrajectoryStatus.FAILED)
+
+    def reset_to_pending(self, trajectory_ids: list[str]) -> None:
+        """Roll back trajectories to PENDING so they can be retried."""
+        self._update_status(trajectory_ids, TrajectoryStatus.PENDING)
 
     def load(self, user_id: str, trajectory_ids: list[str]) -> list[Trajectory]:
         if not trajectory_ids:
