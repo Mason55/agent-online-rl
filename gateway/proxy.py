@@ -1,170 +1,148 @@
 """
-Agent RL Gateway — OpenAI-compatible 透明代理。
+Agent Online-RL Gateway — OpenAI-compatible proxy with per-turn trajectory
+recording, delayed LLM-as-Judge reward, streaming, and LoRA injection.
 
-启动方式:
-    uvicorn gateway.proxy:create_app --factory --host 0.0.0.0 --port 8080
+Usage:
+    # Factory mode (uvicorn)
+    uvicorn gateway.proxy:create_app --factory --host 0.0.0.0 --port 18080
 
-环境变量:
-    INFERENCE_URL      推理服务地址（如 http://localhost:8000）
-    JUDGE_URL          Judge LLM 地址（如 http://localhost:8001）
-    JUDGE_MODEL        Judge 模型名
-    DB_PATH            轨迹数据库路径（默认 trajectories.db）
-    LORA_REPO_ROOT     LoRA 仓库根目录（默认 lora_repo）
-    VLLM_URL           vLLM 推理服务地址（用于热加载通知，默认同 INFERENCE_URL）
+    # CLI mode
+    python -m gateway.proxy --llm-url http://localhost:18000 --model-id Qwen/Qwen3-4B
+
+Environment variables (override CLI flags):
+    LLM_URL, JUDGE_URL, JUDGE_MODEL, MODEL_ID, GATEWAY_PORT, LLM_API_KEY,
+    JUDGE_API_KEY, GATEWAY_API_KEY, RECORD_DIR, LORA_REPO_ROOT, MODE, IO_MODE,
+    ROLLOUT_BATCH_SIZE, REQUEST_TIMEOUT, TRAJECTORY_OUTPUTS, OUTPUT_TO_VERL
 """
 
-import asyncio
-import copy
+from __future__ import annotations
+
+import argparse
 import logging
 import os
-import uuid
-from contextlib import asynccontextmanager
+import sys
 from typing import Optional
 
-import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI
 
-from gateway.recorder import SessionRecorder
-from gateway.reward_computor import RewardComputor
-from inference.notifier import InferenceNotifier
-from storage.lora_repo import LoRARepository
-from storage.models import Trajectory
-from storage.trajectory_store import TrajectoryStore
+from gateway.config import GatewayConfig
+from gateway.judge_scorer import JudgeScorer
+from gateway.processor import LLMMessageProcessor
+from gateway.server import GatewayServer
+from gateway.state import GatewayState
 
-logger = logging.getLogger(__name__)
-
-# ---- 全局单例（由 create_app 初始化）----
-_store: Optional[TrajectoryStore] = None
-_lora_repo: Optional[LoRARepository] = None
-_recorder: Optional[SessionRecorder] = None
-_reward_computor: Optional[RewardComputor] = None
-_notifier: Optional[InferenceNotifier] = None
-_inference_url: str = ""
+logger = logging.getLogger("online_rl.gateway")
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global _store, _lora_repo, _recorder, _reward_computor, _notifier, _inference_url
+def _env(key: str, default: str = "") -> str:
+    return os.environ.get(key, default)
 
-    _inference_url = os.environ["INFERENCE_URL"].rstrip("/")
-    judge_url = os.environ.get("JUDGE_URL", _inference_url)
-    judge_model = os.environ.get("JUDGE_MODEL", "gpt-4")
-    db_path = os.environ.get("DB_PATH", "trajectories.db")
-    lora_root = os.environ.get("LORA_REPO_ROOT", "lora_repo")
-    vllm_url = os.environ.get("VLLM_URL", _inference_url)
 
-    _store = TrajectoryStore(db_path)
-    _lora_repo = LoRARepository(lora_root)
-    _recorder = SessionRecorder()
-    _reward_computor = RewardComputor(judge_url, judge_model)
-    _notifier = InferenceNotifier(vllm_url)
+def build_config_from_env() -> GatewayConfig:
+    """Build config purely from environment variables (for uvicorn factory mode)."""
+    inference_url = _env("INFERENCE_URL", _env("LLM_URL", "http://127.0.0.1:18000"))
+    return GatewayConfig(
+        host=_env("GATEWAY_HOST", "0.0.0.0"),
+        port=int(_env("GATEWAY_PORT", "18080")),
+        rollout_batch_size=int(_env("ROLLOUT_BATCH_SIZE", "8")),
+        llm_url=inference_url,
+        judge_url=_env("JUDGE_URL", inference_url),
+        model_id=_env("MODEL_ID", _env("SERVED_MODEL_NAME", "")),
+        model_path=_env("MODEL_PATH", ""),
+        judge_model=_env("JUDGE_MODEL", ""),
+        mode=_env("MODE", "judge_log"),
+        io_mode=_env("IO_MODE", "string"),
+        request_timeout=float(_env("REQUEST_TIMEOUT", "120")),
+        llm_api_key=_env("LLM_API_KEY", ""),
+        judge_api_key=_env("JUDGE_API_KEY", "EMPTY"),
+        gateway_api_key=_env("GATEWAY_API_KEY", ""),
+        record_dir=_env("RECORD_DIR", "records"),
+        log_level=_env("LOG_LEVEL", "INFO"),
+        dump_token_ids=_env("DUMP_TOKEN_IDS", "").lower() in ("1", "true"),
+        trajectory_outputs=_env("TRAJECTORY_OUTPUTS", ""),
+        trajectory_http_url=_env("TRAJECTORY_HTTP_URL", ""),
+        trace_stages=_env("TRACE_STAGES", "").lower() in ("1", "true"),
+        output_to_verl=_env("OUTPUT_TO_VERL", "").lower() in ("1", "true"),
+        max_pending_verl_batches=int(_env("MAX_PENDING_VERL_BATCHES", "0")),
+        lora_repo_root=_env("LORA_REPO_ROOT", ""),
+    )
 
-    logger.info("Gateway started: inference=%s judge=%s", _inference_url, judge_url)
-    yield
-    logger.info("Gateway stopped")
+
+def build_app_from_config(config: GatewayConfig) -> FastAPI:
+    """Assemble the full gateway app from a config object."""
+    logging.basicConfig(
+        level=getattr(logging, config.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+
+    state = GatewayState(config)
+
+    judge_scorer: Optional[JudgeScorer] = None
+    if config.mode in ("judge_log", "judge_output") and config.judge_url:
+        judge_scorer = JudgeScorer(
+            judge_url=config.judge_url,
+            judge_model=config.judge_model or config.model_id,
+            api_key=config.judge_api_key or "EMPTY",
+        )
+
+    processor = LLMMessageProcessor(state=state, config=config, judge_scorer=judge_scorer)
+
+    lora_repo = None
+    if config.lora_repo_root:
+        try:
+            from storage.lora_repo import LoRARepository
+            lora_repo = LoRARepository(config.lora_repo_root)
+        except Exception:
+            logger.warning("LoRA repo not available at %s", config.lora_repo_root)
+
+    server = GatewayServer(config=config, state=state, processor=processor, lora_repo=lora_repo)
+    return server.build_app()
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="Agent RL Gateway", lifespan=lifespan)
-
-    @app.post("/v1/chat/completions")
-    async def chat_completions(request: Request):
-        user_id = request.headers.get("X-User-ID", "anonymous")
-        session_id = request.headers.get("X-Session-ID", str(uuid.uuid4()))
-
-        body = await request.json()
-
-        # 注入用户私有 LoRA（若存在）
-        latest_lora = _lora_repo.get_latest(user_id)
-        if latest_lora:
-            body.setdefault("extra_body", {})["lora_name"] = user_id
-
-        # 录制请求
-        _recorder.record_request(session_id, user_id, body.get("messages", []))
-
-        # 转发到推理服务
-        is_stream = body.get("stream", False)
-        if is_stream:
-            return await _stream_forward(body, session_id)
-        else:
-            return await _forward(body, session_id)
-
-    @app.get("/health")
-    async def health():
-        return {"status": "ok"}
-
-    return app
+    """Factory for ``uvicorn gateway.proxy:create_app --factory``."""
+    config = build_config_from_env()
+    return build_app_from_config(config)
 
 
-async def _forward(body: dict, session_id: str) -> JSONResponse:
-    async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(
-            f"{_inference_url}/v1/chat/completions",
-            json=body,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+def main() -> None:
+    """CLI entry-point."""
+    parser = argparse.ArgumentParser(description="Online-RL Gateway")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=18080)
+    parser.add_argument("--llm-url", default="http://127.0.0.1:18000")
+    parser.add_argument("--judge-url", default="")
+    parser.add_argument("--model-id", default="")
+    parser.add_argument("--judge-model", default="")
+    parser.add_argument("--mode", default="judge_log", choices=["judge_log", "judge_output", "log"])
+    parser.add_argument("--io-mode", default="string", choices=["string", "token"])
+    parser.add_argument("--rollout-batch-size", type=int, default=8)
+    parser.add_argument("--record-dir", default="records")
+    parser.add_argument("--lora-repo-root", default="")
+    parser.add_argument("--output-to-verl", action="store_true")
+    parser.add_argument("--log-level", default="INFO")
+    args = parser.parse_args()
 
-    # 录制响应，检测 session 是否结束
-    trajectory = _recorder.record_response(session_id, data)
-    if trajectory:
-        asyncio.create_task(_handle_trajectory(trajectory))
+    config = GatewayConfig(
+        host=args.host,
+        port=args.port,
+        rollout_batch_size=args.rollout_batch_size,
+        llm_url=args.llm_url,
+        judge_url=args.judge_url or args.llm_url,
+        model_id=args.model_id,
+        judge_model=args.judge_model,
+        mode=args.mode,
+        io_mode=args.io_mode,
+        record_dir=args.record_dir,
+        lora_repo_root=args.lora_repo_root,
+        output_to_verl=args.output_to_verl,
+        log_level=args.log_level,
+    )
+    app = build_app_from_config(config)
 
-    return JSONResponse(content=data, status_code=resp.status_code)
-
-
-async def _stream_forward(body: dict, session_id: str) -> StreamingResponse:
-    """流式转发：透传 SSE 给 Agent，同时收集完整响应用于录制。"""
-    collected_content = []
-    finish_reason = None
-
-    async def generate():
-        nonlocal finish_reason
-        async with httpx.AsyncClient(timeout=120) as client:
-            async with client.stream(
-                "POST",
-                f"{_inference_url}/v1/chat/completions",
-                json=body,
-            ) as resp:
-                async for line in resp.aiter_lines():
-                    if line.startswith("data: ") and line != "data: [DONE]":
-                        import json
-                        try:
-                            chunk = json.loads(line[6:])
-                            delta = chunk.get("choices", [{}])[0].get("delta", {})
-                            if delta.get("content"):
-                                collected_content.append(delta["content"])
-                            fr = chunk.get("choices", [{}])[0].get("finish_reason")
-                            if fr:
-                                finish_reason = fr
-                        except Exception:
-                            pass
-                    yield line + "\n"
-
-        # 流结束后录制
-        if finish_reason == "stop":
-            fake_response = {
-                "choices": [{
-                    "message": {"content": "".join(collected_content), "role": "assistant"},
-                    "finish_reason": "stop",
-                }]
-            }
-            trajectory = _recorder.record_response(session_id, fake_response)
-            if trajectory:
-                asyncio.create_task(_handle_trajectory(trajectory))
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
+    import uvicorn
+    uvicorn.run(app, host=config.host, port=config.port, log_level=config.log_level.lower())
 
 
-async def _handle_trajectory(trajectory: Trajectory) -> None:
-    """异步：计算 reward → 存储。调度由 TrainingScheduler 负责。"""
-    try:
-        scored = await _reward_computor.compute_async(trajectory)
-        _store.save(scored)
-        logger.info(
-            "Trajectory saved: user=%s reward=%.3f",
-            trajectory.user_id, scored.reward or 0,
-        )
-    except Exception as e:
-        logger.error("Failed to handle trajectory %s: %s", trajectory.trajectory_id, e)
+if __name__ == "__main__":
+    main()
