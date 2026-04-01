@@ -136,6 +136,39 @@ class GatewayState:
     def tokenize_text(self, text: str) -> list[int]:
         return self._tokenizer.encode(text or "", add_special_tokens=False)
 
+    def convert_runtime_tokens_to_ids(self, runtime_tokens: list[dict]) -> list[int]:
+        """Convert vLLM runtime token strings to canonical token IDs.
+
+        Uses single-token encode for each token string.  Falls back to
+        full-text re-tokenization if individual conversion fails.
+        """
+        if not runtime_tokens:
+            return []
+        ids: list[int] = []
+        for tok in runtime_tokens:
+            token_str = tok.get("token", "")
+            encoded = self._tokenizer.encode(token_str, add_special_tokens=False)
+            if len(encoded) == 1:
+                ids.append(encoded[0])
+            elif len(encoded) > 1:
+                ids.extend(encoded)
+            else:
+                ids.append(self._tokenizer.unk_token_id or 0)
+        return ids
+
+    def get_render_fingerprint(self) -> dict:
+        """Build audit fingerprint of the canonical rendering pipeline."""
+        import hashlib
+        template_str = getattr(self._tokenizer, "chat_template", "") or ""
+        template_hash = hashlib.sha256(template_str.encode()).hexdigest()[:16]
+        return {
+            "tokenizer_id": getattr(self._tokenizer, "name_or_path", "unknown"),
+            "chat_template_hash": template_hash,
+            "vocab_size": getattr(self._tokenizer, "vocab_size", 0),
+            "pad_token_id": self._tokenizer.pad_token_id,
+            "eos_token_id": self._tokenizer.eos_token_id,
+        }
+
     def build_prompt_text_and_ids(self, messages: list[dict], tools: Any) -> tuple[str, list[int]]:
         norm_msgs = normalize_messages_for_template(messages)
         try:
@@ -152,6 +185,127 @@ class GatewayState:
                 for m in norm_msgs
             )
         return prompt_text, self.tokenize_text(prompt_text)
+
+    def build_prompt_mask(
+        self, messages: list[dict], tools: Any,
+    ) -> list[int]:
+        """Build a per-token mask for the prompt where only the **content**
+        tokens of assistant messages are marked 1, everything else 0.
+
+        Uses text-level rendering to locate the exact byte spans of each
+        assistant message's content, then maps those spans to token positions.
+        This ensures chat-template formatting tokens (``<|im_start|>``,
+        ``<|im_end|>``, role headers, etc.) are always 0, and only actual
+        model-generated content is 1.
+
+        Mask semantics:
+          - ``system``, ``user``, ``tool`` message content → 0
+          - chat-template formatting/separators  → 0
+          - ``assistant`` message content (historical model output) → 1
+          - the trailing generation prompt  → 0
+        """
+        norm_msgs = normalize_messages_for_template(messages)
+        if not norm_msgs:
+            return []
+
+        try:
+            full_text = self._tokenizer.apply_chat_template(
+                norm_msgs, tools=tools, tokenize=False, add_generation_prompt=True,
+            )
+        except TypeError:
+            full_text = self._tokenizer.apply_chat_template(
+                norm_msgs, tokenize=False, add_generation_prompt=True,
+            )
+        except Exception:
+            full_text = "\n".join(
+                f"{m.get('role', 'unknown')}: {flatten_message_content(m.get('content', ''))}"
+                for m in norm_msgs
+            )
+
+        full_ids = self.tokenize_text(full_text)
+        if not full_ids:
+            return []
+
+        # Find character-level spans of each assistant content in full_text.
+        # We search for each assistant content string and mark those char
+        # positions, then map chars → tokens via offset_mapping.
+        assistant_char_mask = [False] * len(full_text)
+
+        search_cursor = 0
+        for msg in norm_msgs:
+            if msg.get("role") != "assistant":
+                continue
+            content = flatten_message_content(msg.get("content", ""))
+            if not content:
+                continue
+            pos = full_text.find(content, search_cursor)
+            if pos >= 0:
+                for ci in range(pos, pos + len(content)):
+                    assistant_char_mask[ci] = True
+                search_cursor = pos + len(content)
+
+        # Now map char positions to token positions using the tokenizer's
+        # offset_mapping (char start, char end for each token).
+        encoding = self._tokenizer(
+            full_text, add_special_tokens=False, return_offsets_mapping=True,
+        )
+        offset_mapping = encoding.get("offset_mapping", [])
+        token_ids_from_enc = encoding.get("input_ids", [])
+
+        if offset_mapping and len(offset_mapping) == len(token_ids_from_enc):
+            mask = []
+            for (char_start, char_end) in offset_mapping:
+                if char_start == char_end:
+                    mask.append(0)
+                    continue
+                # A token is marked 1 if the majority of its chars are in
+                # an assistant content span
+                assistant_chars = sum(
+                    1 for c in range(char_start, char_end) if c < len(assistant_char_mask) and assistant_char_mask[c]
+                )
+                total_chars = char_end - char_start
+                mask.append(1 if assistant_chars > total_chars // 2 else 0)
+        else:
+            # Fallback: use incremental rendering approach
+            mask = self._build_prompt_mask_incremental(norm_msgs, tools, full_ids)
+
+        # Ensure length matches
+        if len(mask) < len(full_ids):
+            mask.extend([0] * (len(full_ids) - len(mask)))
+        elif len(mask) > len(full_ids):
+            mask = mask[:len(full_ids)]
+
+        return mask
+
+    def _build_prompt_mask_incremental(
+        self, norm_msgs: list[dict], tools: Any, full_ids: list[int],
+    ) -> list[int]:
+        """Fallback: incremental rendering to approximate role spans."""
+        def _render(msgs: list[dict], add_gen: bool) -> list[int]:
+            try:
+                return self._tokenizer.apply_chat_template(
+                    msgs, tools=tools, tokenize=True, add_generation_prompt=add_gen,
+                )
+            except TypeError:
+                return self._tokenizer.apply_chat_template(
+                    msgs, tokenize=True, add_generation_prompt=add_gen,
+                )
+            except Exception:
+                return []
+
+        mask: list[int] = []
+        prev_ids: list[int] = []
+        for i, msg in enumerate(norm_msgs):
+            cur_ids = _render(norm_msgs[:i + 1], add_gen=False)
+            delta_len = len(cur_ids) - len(prev_ids)
+            role = msg.get("role", "")
+            mask.extend([1 if role == "assistant" else 0] * max(delta_len, 0))
+            prev_ids = cur_ids
+
+        gen_prompt_len = len(full_ids) - len(prev_ids)
+        if gen_prompt_len > 0:
+            mask.extend([0] * gen_prompt_len)
+        return mask
 
     async def forward_string(self, body: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
         self._string_forwarder.http_client = self._http_client

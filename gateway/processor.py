@@ -68,7 +68,25 @@ class LLMMessageProcessor:
         response_ids: list[int],
         response_logprobs: list[float],
         tool_calls: list[dict[str, Any]],
+        prompt_mask: Optional[list[int]] = None,
+        render_fingerprint: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
+        input_ids = prompt_ids + response_ids
+
+        # Per-turn training (OpenClaw-RL style): each sample is one turn.
+        # prompt = full context up to this turn → mask 0 (not in loss).
+        # response = current turn's model output → mask 1 (in loss).
+        # Historical assistant content lives in the prompt but belongs to
+        # earlier turns that have their own training samples, so prompt is
+        # always 0 here.
+        #
+        # prompt_mask is available for episode-level training where the
+        # entire multi-turn trajectory is one sequence and historical
+        # assistant spans need mask=1 too.
+        response_mask = [0] * len(prompt_ids) + [1] * len(response_ids)
+
+        attention_mask = [1] * len(input_ids)
+
         return {
             "sample_id": str(uuid.uuid4()),
             "created_at": utc_now_iso(),
@@ -77,6 +95,7 @@ class LLMMessageProcessor:
             "mode": self._config.mode,
             "io_mode": self._config.io_mode,
             "model": response_json.get("model", body.get("model", self._config.model_id)),
+            "render_fingerprint": render_fingerprint,
             "request": {
                 "messages": messages,
                 "tools": body.get("tools"),
@@ -90,7 +109,9 @@ class LLMMessageProcessor:
                 "finish_reason": finish_reason,
             },
             "trajectory": {
-                "input_ids": prompt_ids + response_ids,
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "response_mask": response_mask,
                 "prompt_text": prompt_text,
                 "prompt_ids": prompt_ids,
                 "response_text": response_text,
@@ -99,6 +120,32 @@ class LLMMessageProcessor:
                 "tool_calls": tool_calls,
             },
         }
+
+    # ---- Token resolution ----
+
+    def _resolve_response_tokens(
+        self,
+        *,
+        runtime_tokens: list[dict[str, Any]],
+        response_text: str,
+        fallback_logprobs: list[float],
+    ) -> tuple[list[int], list[float]]:
+        """Resolve response_ids and logprobs from runtime token truth.
+
+        Prefers vLLM's runtime token data (from logprobs) to avoid
+        re-tokenisation drift.  Falls back to tokenize_text when runtime
+        tokens are unavailable.
+        """
+        if runtime_tokens:
+            response_ids = self._state.convert_runtime_tokens_to_ids(runtime_tokens)
+            response_logprobs = [t["logprob"] for t in runtime_tokens]
+            if len(response_ids) != len(response_logprobs):
+                response_logprobs = fit_list(response_logprobs, len(response_ids))
+            return response_ids, response_logprobs
+
+        response_ids = self._state.tokenize_text(response_text)
+        response_logprobs = fit_list(fallback_logprobs, len(response_ids))
+        return response_ids, response_logprobs
 
     # ---- Delayed Judge scoring ----
 
@@ -232,9 +279,15 @@ class LLMMessageProcessor:
         assistant_msg = forward["assistant_message"]
         response_text = forward["response_text"]
         tool_calls = forward["tool_calls"]
-        response_ids = self._state.tokenize_text(response_text)
-        response_logprobs = fit_list(forward.get("response_logprobs", []), len(response_ids))
+        runtime_tokens = forward.get("runtime_tokens", [])
+
+        response_ids, response_logprobs = self._resolve_response_tokens(
+            runtime_tokens=runtime_tokens,
+            response_text=response_text,
+            fallback_logprobs=forward.get("response_logprobs", []),
+        )
         finish_reason = self._extract_finish_reason(response_json)
+        render_fp = self._state.get_render_fingerprint()
 
         samples_to_record, feedback_instruction = await self._collect_scored_previous_sample(
             messages=messages, session_id=session_id, turn_num=turn_num, trace_id=trace_id,
@@ -246,7 +299,7 @@ class LLMMessageProcessor:
             finish_reason=finish_reason, prompt_text=prompt_text,
             prompt_ids=prompt_ids, response_text=response_text,
             response_ids=response_ids, response_logprobs=response_logprobs,
-            tool_calls=tool_calls,
+            tool_calls=tool_calls, render_fingerprint=render_fp,
         )
         await self._queue_current_sample(
             sample=sample, body=body, feedback_instruction=feedback_instruction,
@@ -292,13 +345,18 @@ class LLMMessageProcessor:
             async for line in line_iter:
                 yield line
 
-            # Stream ended – now do trajectory recording in the background
             forward_result = self._state.parse_collected_stream(collector)
             response_text = forward_result["response_text"]
             tool_calls = forward_result["tool_calls"]
-            response_ids = self._state.tokenize_text(response_text)
-            response_logprobs = fit_list(forward_result.get("response_logprobs", []), len(response_ids))
+            runtime_tokens = forward_result.get("runtime_tokens", [])
+
+            response_ids, response_logprobs = self._resolve_response_tokens(
+                runtime_tokens=runtime_tokens,
+                response_text=response_text,
+                fallback_logprobs=forward_result.get("response_logprobs", []),
+            )
             finish_reason = self._extract_finish_reason(forward_result["response_json"])
+            render_fp = self._state.get_render_fingerprint()
 
             samples_to_record, feedback_instruction = await self._collect_scored_previous_sample(
                 messages=messages, session_id=session_id, turn_num=turn_num, trace_id=trace_id,
@@ -310,7 +368,7 @@ class LLMMessageProcessor:
                 finish_reason=finish_reason, prompt_text=prompt_text,
                 prompt_ids=prompt_ids, response_text=response_text,
                 response_ids=response_ids, response_logprobs=response_logprobs,
-                tool_calls=tool_calls,
+                tool_calls=tool_calls, render_fingerprint=render_fp,
             )
             await self._queue_current_sample(
                 sample=sample, body=body, feedback_instruction=feedback_instruction,

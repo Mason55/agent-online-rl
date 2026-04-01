@@ -163,28 +163,23 @@ class OnlineTrainingScheduler:
 
         from trainer.batch_lora_trainer import run_verl_lora_sft, _find_latest_checkpoint, _convert_fsdp_to_peft
 
-        env_overrides = {}
+        extra_env = {}
         if self.training_gpu_ids:
-            env_overrides["CUDA_VISIBLE_DEVICES"] = self.training_gpu_ids
+            extra_env["CUDA_VISIBLE_DEVICES"] = self.training_gpu_ids
 
         existing_lora = None
         if self.lora_repo:
             existing_lora = self.lora_repo.get_latest("online")
 
-        old_env = os.environ.copy()
-        try:
-            os.environ.update(env_overrides)
-            run_verl_lora_sft(
-                base_model=self.base_model_path,
-                train_parquet=parquet_path,
-                output_dir=verl_output_dir,
-                config_path=self.verl_config_path,
-                lora_adapter_path=existing_lora.path if existing_lora else None,
-                nproc_per_node=self.nproc_per_node,
-            )
-        finally:
-            os.environ.clear()
-            os.environ.update(old_env)
+        run_verl_lora_sft(
+            base_model=self.base_model_path,
+            train_parquet=parquet_path,
+            output_dir=verl_output_dir,
+            config_path=self.verl_config_path,
+            lora_adapter_path=existing_lora.path if existing_lora else None,
+            nproc_per_node=self.nproc_per_node,
+            extra_env=extra_env,
+        )
 
         ckpt_dir = _find_latest_checkpoint(verl_output_dir)
         peft_dir = str(run_dir / "peft_adapter")
@@ -208,7 +203,13 @@ class OnlineTrainingScheduler:
                     logger.warning("Failed to notify vLLM for LoRA hot-load (non-fatal)")
 
     def _samples_to_parquet(self, samples: list[dict], output_path: str) -> None:
-        """Convert gateway samples to a parquet file for verl SFT."""
+        """Convert gateway samples to a parquet file for verl SFT.
+
+        verl's MultiturnSFTDataset expects a ``messages`` column where each
+        row is a JSON-encoded list of ``{"role": ..., "content": ...}``
+        dicts representing one complete conversation (prompt messages +
+        the assistant response for this turn).
+        """
         try:
             import pandas as pd
         except ImportError:
@@ -216,14 +217,42 @@ class OnlineTrainingScheduler:
 
         rows = []
         for s in samples:
-            traj = s.get("trajectory", {})
-            prompt_text = traj.get("prompt_text", "")
-            response_text = traj.get("response_text", "")
-            if not prompt_text and not response_text:
+            req = s.get("request", {})
+            resp = s.get("response", {})
+            messages = req.get("messages") or []
+            assistant_msg = resp.get("message") or {}
+
+            if not messages and not assistant_msg:
+                traj = s.get("trajectory", {})
+                prompt_text = traj.get("prompt_text", "")
+                response_text = traj.get("response_text", "")
+                if not prompt_text and not response_text:
+                    continue
+                messages = [
+                    {"role": "user", "content": prompt_text},
+                ]
+                assistant_msg = {"role": "assistant", "content": response_text}
+
+            def _clean_msg(m: dict) -> dict:
+                content = m.get("content", "")
+                if not isinstance(content, str):
+                    content = str(content) if content else ""
+                return {"role": m.get("role", "user"), "content": content}
+
+            conversation = [_clean_msg(m) for m in messages]
+            assistant_content = str(assistant_msg.get("content", "") or "")
+            if assistant_msg:
+                conversation.append({
+                    "role": "assistant",
+                    "content": assistant_content,
+                })
+
+            if not assistant_content.strip():
+                logger.debug("Skipping sample with empty assistant content")
                 continue
+
             rows.append({
-                "prompt": prompt_text,
-                "response": response_text,
+                "messages": conversation,
                 "reward": s.get("judge", {}).get("score", 0.0),
             })
 

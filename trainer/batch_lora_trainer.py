@@ -95,18 +95,10 @@ def _convert_fsdp_to_peft(ckpt_dir: Path, base_model: str, lora_output_dir: str)
                 merged[key] = tensors[0]
 
     lora_state_dict = {}
-    prefix_map = {
-        "base_model.model.": "",
-    }
     for key, value in merged.items():
         if "lora_" not in key:
             continue
-        clean_key = key
-        for old_prefix, new_prefix in prefix_map.items():
-            if clean_key.startswith(old_prefix):
-                clean_key = new_prefix + clean_key[len(old_prefix):]
-                break
-        lora_state_dict[clean_key] = value
+        lora_state_dict[key] = value
 
     if not lora_state_dict:
         logger.warning("No LoRA parameters found in checkpoint; publishing raw FSDP checkpoint")
@@ -150,6 +142,7 @@ def run_verl_lora_sft(
     lora_adapter_path: Optional[str] = None,
     nproc_per_node: int = 1,
     extra_overrides: Optional[list[str]] = None,
+    extra_env: Optional[dict[str, str]] = None,
 ) -> None:
     """以子进程方式运行 verl SFT Trainer 训练 LoRA。
 
@@ -161,28 +154,38 @@ def run_verl_lora_sft(
         lora_adapter_path: 增量训练时的历史 LoRA 路径，None 表示随机初始化
         nproc_per_node:    每节点 GPU 数量
         extra_overrides:   额外 Hydra 配置覆盖项
+        extra_env:         额外环境变量 (e.g. CUDA_VISIBLE_DEVICES)
     """
     base_model = base_model.rstrip("/")
     overrides = [
         f"model.path={base_model}",
         f"data.train_files={train_parquet}",
         f"trainer.default_local_dir={output_dir}",
+        f"trainer.n_gpus_per_node={nproc_per_node}",
     ]
     if lora_adapter_path:
         overrides.append(f"model.lora_adapter_path={lora_adapter_path}")
     if extra_overrides:
         overrides.extend(extra_overrides)
 
+    import random
+    master_port = random.randint(29500, 29999)
     cmd = [
         "torchrun",
         f"--nproc_per_node={nproc_per_node}",
+        f"--master_port={master_port}",
         "-m", "verl.trainer.sft_trainer",
         f"--config-path={Path(config_path).parent}",
         f"--config-name={Path(config_path).stem}",
     ] + overrides
 
-    logger.info("Running verl SFT: %s", " ".join(cmd))
-    result = subprocess.run(cmd, check=True, capture_output=False)
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+
+    logger.info("Running verl SFT: %s (env: %s)", " ".join(cmd),
+                {k: v for k, v in (extra_env or {}).items()})
+    result = subprocess.run(cmd, check=True, capture_output=False, env=env)
     logger.info("verl SFT completed with return code %d", result.returncode)
 
 

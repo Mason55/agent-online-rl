@@ -1,0 +1,9 @@
+__pycache__/
+*.py[codz]
+*.so
+outputs/
+records/
+*.egg-info/
+dist/
+build/
+.eggs/

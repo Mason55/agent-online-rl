@@ -27,6 +27,31 @@ from gateway.message_utils import (
 logger = logging.getLogger("online_rl.gateway")
 
 
+def _extract_runtime_tokens_from_logprobs(choice: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract per-token runtime data from vLLM's logprobs.content[].
+
+    Returns a list of dicts with ``token`` (str), ``logprob`` (float), and
+    ``bytes`` (list[int] or None).  This is the "runtime token truth" —
+    the exact token sequence the model generated, before any re-tokenisation.
+    """
+    logprobs_obj = choice.get("logprobs")
+    if not isinstance(logprobs_obj, dict):
+        return []
+    content = logprobs_obj.get("content")
+    if not isinstance(content, list) or not content:
+        return []
+    result: list[dict[str, Any]] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        result.append({
+            "token": item.get("token", ""),
+            "logprob": float(item.get("logprob", 0.0)),
+            "bytes": item.get("bytes"),
+        })
+    return result
+
+
 class StringForwarder:
     """Forward chat requests to /v1/chat/completions.
 
@@ -54,6 +79,8 @@ class StringForwarder:
         if "model" not in send_body:
             send_body["model"] = self.model_id
         send_body["messages"] = body.get("messages", [])
+        send_body["logprobs"] = True
+        send_body["top_logprobs"] = 1
         return send_body
 
     async def forward(self, body: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
@@ -89,6 +116,9 @@ class StringForwarder:
         if "model" not in send_body:
             send_body["model"] = self.model_id
         send_body["messages"] = body.get("messages", [])
+        send_body["logprobs"] = True
+        send_body["top_logprobs"] = 1
+        send_body["stream_options"] = {"include_usage": False}
 
         collector = StreamCollector()
 
@@ -103,10 +133,22 @@ class StringForwarder:
                     if line.startswith("data: ") and line != "data: [DONE]":
                         try:
                             chunk = json.loads(line[6:])
-                            delta = chunk.get("choices", [{}])[0].get("delta", {})
+                            choice0 = chunk.get("choices", [{}])[0]
+                            delta = choice0.get("delta", {})
                             if delta.get("content"):
                                 collector.content_parts.append(delta["content"])
-                            fr = chunk.get("choices", [{}])[0].get("finish_reason")
+                            chunk_logprobs = choice0.get("logprobs")
+                            if isinstance(chunk_logprobs, dict):
+                                lp_content = chunk_logprobs.get("content")
+                                if isinstance(lp_content, list):
+                                    for lp_item in lp_content:
+                                        if isinstance(lp_item, dict):
+                                            collector.runtime_tokens.append({
+                                                "token": lp_item.get("token", ""),
+                                                "logprob": float(lp_item.get("logprob", 0.0)),
+                                                "bytes": lp_item.get("bytes"),
+                                            })
+                            fr = choice0.get("finish_reason")
                             if fr:
                                 collector.finish_reason = fr
                             if not collector.model:
@@ -145,12 +187,15 @@ class StringForwarder:
         if not response_text and tool_calls:
             response_text = json.dumps(tool_calls, ensure_ascii=False)
 
+        runtime_tokens = _extract_runtime_tokens_from_logprobs(choice)
+
         return {
             "response_json": data,
             "assistant_message": msg,
             "response_text": response_text,
             "tool_calls": tool_calls,
-            "response_logprobs": extract_logprobs_from_chat_response(choice),
+            "response_logprobs": [t["logprob"] for t in runtime_tokens],
+            "runtime_tokens": runtime_tokens,
         }
 
     def parse_collected_stream(self, collector: "StreamCollector") -> dict[str, Any]:
@@ -181,20 +226,24 @@ class StringForwarder:
             "choices": [{"index": 0, "message": msg, "finish_reason": finish_reason}],
         }
 
+        runtime_tokens = collector.runtime_tokens
+
         return {
             "response_json": response_json,
             "assistant_message": msg,
             "response_text": response_text,
             "tool_calls": tool_calls,
-            "response_logprobs": [],
+            "response_logprobs": [t["logprob"] for t in runtime_tokens],
+            "runtime_tokens": runtime_tokens,
         }
 
 
 class StreamCollector:
-    """Accumulates content from SSE chunks during streaming."""
+    """Accumulates content and logprobs from SSE chunks during streaming."""
 
     def __init__(self) -> None:
         self.content_parts: list[str] = []
+        self.runtime_tokens: list[dict[str, Any]] = []
         self.finish_reason: str | None = None
         self.model: str = ""
         self.response_id: str = ""

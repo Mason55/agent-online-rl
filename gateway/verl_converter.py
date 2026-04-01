@@ -45,6 +45,9 @@ class VerlDataProtoConverter:
         input_ids = torch.full((bs, input_max), self.pad_token_id, dtype=torch.long)
         attention_mask = torch.zeros((bs, input_max), dtype=torch.long)
         position_ids = torch.zeros((bs, input_max), dtype=torch.long)
+        # Per-turn training (OpenClaw-RL style): response_mask covers only
+        # the response portion.  prompt=0 (context, not in loss),
+        # response=1 (current turn model output, in loss).
         response_mask = torch.zeros((bs, response_max), dtype=torch.long)
         old_log_probs = torch.zeros((bs, response_max), dtype=torch.float32)
         token_level_scores = torch.zeros((bs, response_max), dtype=torch.float32)

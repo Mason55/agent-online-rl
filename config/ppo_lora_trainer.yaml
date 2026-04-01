@@ -16,10 +16,10 @@ data:
   train_files: ???
   val_files: null
   train_batch_size: 4
-  micro_batch_size_per_gpu: 2
+  micro_batch_size_per_gpu: 1
   max_token_len_per_gpu: 8192
   use_dynamic_bsz: false
-  max_length: 2048
+  max_length: 8192
   truncation: right
   pad_mode: no_padding
   messages_key: messages
@@ -49,7 +49,7 @@ model:
   external_lib: null
   override_config: {}
   enable_gradient_checkpointing: true
-  enable_activation_offload: false
+  enable_activation_offload: true
   use_remove_padding: false
   lora_rank: 16
   lora_alpha: 32
@@ -82,8 +82,8 @@ engine:
   _target_: verl.workers.config.FSDPEngineConfig
   wrap_policy:
     min_num_params: 0
-  param_offload: false
-  optimizer_offload: false
+  param_offload: true
+  optimizer_offload: true
   offload_policy: false
   reshard_after_forward: true
   fsdp_size: -1
