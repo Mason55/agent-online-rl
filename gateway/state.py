@@ -331,6 +331,7 @@ class GatewayState:
 
     async def stage_pending_judge_sample(self, session_id: str, sample: dict[str, Any]) -> None:
         async with self._lock:
+            #TODO 如果是多用户的时候如何处理?
             self._pending_judge_samples[session_id] = sample
 
     async def pop_pending_judge_sample(self, session_id: str) -> Optional[dict[str, Any]]:

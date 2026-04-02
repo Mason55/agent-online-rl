@@ -97,6 +97,7 @@ class GatewayServer:
 
             stream = bool(body.get("stream", False))
 
+            #TODO stream是否有问题？
             if stream:
                 gen = await self.processor.process_chat_completions_stream(
                     request=request, body=body, x_session_id=resolved_session,

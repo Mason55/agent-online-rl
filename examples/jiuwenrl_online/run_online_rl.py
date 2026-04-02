@@ -221,6 +221,7 @@ def _start_gateway(
     env = os.environ.copy()
     env['LLM_URL'] = inference_url
     env['JUDGE_URL'] = judge_url
+    #TODO 这里是不是可以合并起来
     env['JUDGE_MODEL'] = judge_model
     env['MODEL_ID'] = model_id
     env['MODEL_PATH'] = model_path
@@ -231,11 +232,12 @@ def _start_gateway(
     if lora_repo_root:
         env['LORA_REPO_ROOT'] = lora_repo_root
 
+    #TODO 子进程不合适，考虑单独拉起
     cmd = [
         sys.executable, '-m', 'uvicorn',
         'gateway.proxy:create_app',
         '--factory',
-        '--host', '0.0.0.0',
+        '--host', '0.0.0.0', #TODO 应该可配置
         '--port', str(port),
         '--log-level', 'info',
     ]

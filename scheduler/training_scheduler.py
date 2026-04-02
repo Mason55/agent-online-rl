@@ -27,7 +27,7 @@ class _ActiveJob:
     job_id: str
     user_jobs: list[UserTrainingJob]
 
-
+#TODO 删除死代码
 class TrainingScheduler:
     def __init__(
         self,
@@ -102,6 +102,7 @@ class TrainingScheduler:
 
     def _scan_once(self) -> Optional[str]:
         """执行一次扫描，若有满足条件的用户则提交批量训练任务，返回 job_id 或 None。"""
+        #TODO 改成future promise模型，而不是轮询
         eligible_users = self.store.get_users_above_threshold(self.threshold)
         if not eligible_users:
             logger.debug("No users above training threshold (%d)", self.threshold)

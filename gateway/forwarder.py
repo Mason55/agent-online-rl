@@ -52,6 +52,7 @@ def _extract_runtime_tokens_from_logprobs(choice: dict[str, Any]) -> list[dict[s
     return result
 
 
+#TODO 删除这种实现
 class StringForwarder:
     """Forward chat requests to /v1/chat/completions.
 
@@ -277,6 +278,7 @@ class TokenForwarder:
         prompt_ids: list[int],
         headers: dict[str, str],
     ) -> dict[str, Any]:
+        #TODO 这里要配置 vllm token in token out的参数
         send_body: dict[str, Any] = {k: v for k, v in body.items() if k in self._ALLOWED_KEYS}
         send_body["model"] = send_body.get("model") or self.model_id
         send_body["prompt"] = prompt_ids
@@ -301,6 +303,7 @@ class TokenForwarder:
         choices = completion_data.get("choices")
         choice = choices[0] if isinstance(choices, list) and choices else {}
         raw_text = choice.get("text") or ""
+        #TODO check this
         cleaned, parsed_tools, reasoning = extract_tool_calls_from_text(raw_text)
 
         assistant_msg: dict[str, Any] = {"role": "assistant", "content": cleaned}

@@ -103,7 +103,7 @@ class JudgeScorer:
             json={
                 "model": self.judge_model,
                 "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
+                "temperature": 0.1, #TODO 这里需要可配置
             },
         )
         resp.raise_for_status()
