@@ -1,0 +1,13 @@
+# Runtime artifacts
+trajectories.db
+trajectories.db-shm
+trajectories.db-wal
+lora_repo/
+logs/
+outputs/
+rollout_output/
+tensorboard_log/
+checkpoints/
+
+# Data files (generated, not source)
+*.parquet
