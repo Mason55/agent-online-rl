@@ -384,8 +384,8 @@ def main() -> None:
     parser.add_argument('--gateway-mode', default='judge_output',
                         choices=['judge_log', 'judge_output', 'log'],
                         help='Gateway 模式: judge_output(打分+记录+训练队列, 默认), judge_log(打分+记录,不入队), log(仅记录)')
-    parser.add_argument('--rollout-batch-size', type=int, default=8, help='Gateway batch 大小')
-    parser.add_argument('--threshold', type=int, default=4, help='触发训练的样本数阈值')
+    parser.add_argument('--rollout-batch-size', type=int, default=4, help='Gateway batch 大小 (凑满后入训练队列)')
+    parser.add_argument('--threshold', type=int, default=4, help='触发训练的样本数阈值 (应 >= rollout-batch-size)')
     parser.add_argument('--scan-interval', type=int, default=30, help='TrainingScheduler 扫描间隔 (秒)')
     parser.add_argument('--train-gpu', default='2,3', help='训练使用的 GPU (逗号分隔)')
     parser.add_argument('--lora-repo', default=None, help='LoRA 存储目录 (默认: ./lora_repo)')
