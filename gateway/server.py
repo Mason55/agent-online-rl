@@ -97,8 +97,14 @@ class GatewayServer:
 
             stream = bool(body.get("stream", False))
 
-            #TODO stream是否有问题？
+            # TODO: remove this once the streaming path is fixed
+            # Force non-streaming: the streaming path has a bug where the
+            # async generator's post-yield trajectory recording code never
+            # executes, causing total_samples to stay 0.  Disable until fixed.
             if stream:
+                body["stream"] = False
+
+            if False:  # streaming disabled — see above
                 gen = await self.processor.process_chat_completions_stream(
                     request=request, body=body, x_session_id=resolved_session,
                 )
