@@ -171,13 +171,30 @@ class OnlineTrainingScheduler:
         if self.lora_repo:
             existing_lora = self.lora_repo.get_latest("online")
 
+        try:
+            import pandas as pd
+            n_samples = len(pd.read_parquet(parquet_path))
+        except Exception:
+            n_samples = len(samples)
+
+        actual_nproc = min(self.nproc_per_node, n_samples)
+        actual_nproc = max(actual_nproc, 1)
+        safe_batch = max(actual_nproc, 2)
+
+        overrides = [
+            f"data.train_batch_size={safe_batch}",
+        ]
+        if actual_nproc != self.nproc_per_node:
+            logger.info("Reduced nproc_per_node %d -> %d (only %d samples)", self.nproc_per_node, actual_nproc, n_samples)
+
         run_verl_lora_sft(
             base_model=self.base_model_path,
             train_parquet=parquet_path,
             output_dir=verl_output_dir,
             config_path=self.verl_config_path,
             lora_adapter_path=existing_lora.path if existing_lora else None,
-            nproc_per_node=self.nproc_per_node,
+            nproc_per_node=actual_nproc,
+            extra_overrides=overrides,
             extra_env=extra_env,
         )
 
@@ -258,6 +275,13 @@ class OnlineTrainingScheduler:
 
         if not rows:
             raise ValueError("No valid samples for training")
+
+        min_rows = max(self.nproc_per_node, 2)
+        if len(rows) < min_rows:
+            original_len = len(rows)
+            while len(rows) < min_rows:
+                rows.append(rows[len(rows) % original_len])
+            logger.info("Padded %d -> %d samples (minimum for %d GPUs)", original_len, len(rows), self.nproc_per_node)
 
         df = pd.DataFrame(rows)
         df.to_parquet(output_path, index=False)
