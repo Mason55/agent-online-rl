@@ -293,6 +293,7 @@ def _start_jiuwenclaw() -> tuple[subprocess.Popen, subprocess.Popen | None]:
     """Start JiuwenClaw app + web frontend (if dist exists)."""
     env = os.environ.copy()
     env['PYTHONPATH'] = f"{JIUWENCLAW_REPO}:{env.get('PYTHONPATH', '')}".rstrip(':')
+    env['WEB_HOST'] = '0.0.0.0'
 
     cmd = [sys.executable, '-m', 'jiuwenclaw.app']
     log.info('[4/5] Starting JiuwenClaw app ...')
