@@ -97,30 +97,26 @@ class GatewayServer:
 
             stream = bool(body.get("stream", False))
 
-            # TODO: remove this once the streaming path is fixed
-            # Force non-streaming: the streaming path has a bug where the
-            # async generator's post-yield trajectory recording code never
-            # executes, causing total_samples to stay 0.  Disable until fixed.
+            # Streaming workaround: the original streaming path puts trajectory
+            # recording inside the async generator's post-yield code, which
+            # Starlette never executes.  Instead, force non-streaming to vLLM,
+            # record the trajectory normally, then re-wrap as SSE if the client
+            # originally asked for streaming.
+            client_wants_stream = stream
             if stream:
                 body["stream"] = False
 
-            if False:  # streaming disabled — see above
-                gen = await self.processor.process_chat_completions_stream(
-                    request=request, body=body, x_session_id=resolved_session,
+            result = await self.processor.process_chat_completions(
+                request=request, body=body, x_session_id=resolved_session,
+            )
+            response_json = result["response_json"]
+
+            if client_wants_stream:
+                return StreamingResponse(
+                    self.state.stream_chat_response(response_json),
+                    media_type="text/event-stream",
                 )
-                return StreamingResponse(gen, media_type="text/event-stream")
-            else:
-                result = await self.processor.process_chat_completions(
-                    request=request, body=body, x_session_id=resolved_session,
-                )
-                response_json = result["response_json"]
-                want_stream = result.get("stream", False)
-                if want_stream:
-                    return StreamingResponse(
-                        self.state.stream_chat_response(response_json),
-                        media_type="text/event-stream",
-                    )
-                return JSONResponse(content=response_json)
+            return JSONResponse(content=response_json)
 
         @app.api_route(
             "/{path:path}",
