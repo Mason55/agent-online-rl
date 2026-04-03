@@ -48,9 +48,11 @@ class GatewayState:
         self.batch_file = os.path.join(config.record_dir, "batches.jsonl")
 
         self._session_turn_count: dict[str, int] = {}
+        self._session_last_active: dict[str, float] = {}
         self._pending_samples: list[dict[str, Any]] = []
         self._pending_judge_samples: dict[str, dict[str, Any]] = {}
-        self._training_queue: deque[dict[str, Any]] = deque()
+        self._pending_judge_timestamps: dict[str, float] = {}
+        self._training_queue: deque[dict[str, Any]] = deque(maxlen=200)
 
         self._output_to_verl = bool(config.output_to_verl)
         self._max_pending_verl_batches = max(0, config.max_pending_verl_batches)
@@ -59,7 +61,7 @@ class GatewayState:
             if self._output_to_verl else None
         )
         self._pending_verl_dataproto: deque[Any] = deque()
-        self._pending_verl_errors: deque[Exception] = deque()
+        self._pending_verl_errors: deque[Exception] = deque(maxlen=50)
         self._verl_waiters: deque[asyncio.Future[Any]] = deque()
         self._dropped_verl_batches = 0
 
@@ -126,8 +128,22 @@ class GatewayState:
 
     async def next_turn_num(self, session_id: str) -> int:
         async with self._lock:
+            now = time.time()
             self._session_turn_count[session_id] = self._session_turn_count.get(session_id, 0) + 1
+            self._session_last_active[session_id] = now
+            self._gc_stale_sessions(now)
             return self._session_turn_count[session_id]
+
+    def _gc_stale_sessions(self, now: float, ttl: float = 3600.0) -> None:
+        """Remove session state older than ttl seconds. Caller must hold _lock."""
+        stale = [sid for sid, ts in self._session_last_active.items() if now - ts > ttl]
+        for sid in stale:
+            self._session_turn_count.pop(sid, None)
+            self._session_last_active.pop(sid, None)
+            expired_sample = self._pending_judge_samples.pop(sid, None)
+            self._pending_judge_timestamps.pop(sid, None)
+            if expired_sample:
+                logger.debug("[GC] Expired pending judge sample for session %s", sid)
 
     async def inc_request_counter(self) -> None:
         async with self._lock:
@@ -331,8 +347,8 @@ class GatewayState:
 
     async def stage_pending_judge_sample(self, session_id: str, sample: dict[str, Any]) -> None:
         async with self._lock:
-            #TODO 如果是多用户的时候如何处理?
             self._pending_judge_samples[session_id] = sample
+            self._pending_judge_timestamps[session_id] = time.time()
 
     async def pop_pending_judge_sample(self, session_id: str) -> Optional[dict[str, Any]]:
         async with self._lock:
@@ -393,7 +409,7 @@ class GatewayState:
                 "pending_judge_samples": len(self._pending_judge_samples),
                 "emitted_batches": self._emitted_batches,
                 "training_queue_batches": len(self._training_queue),
-                "known_sessions": len(self._session_turn_count),
+                "active_sessions": len(self._session_turn_count),
                 "llm_url": self.config.llm_url,
                 "judge_url": self.config.judge_url,
                 "model_id": self.config.model_id,

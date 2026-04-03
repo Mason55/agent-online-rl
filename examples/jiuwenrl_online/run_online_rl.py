@@ -114,6 +114,13 @@ def _terminate(proc: subprocess.Popen | None) -> None:
         proc.wait(timeout=5)
 
 
+def _open_log_file(name: str, log_dir: Path):
+    """Open a persistent log file for subprocess stdout/stderr redirection."""
+    log_dir.mkdir(exist_ok=True)
+    log_path = log_dir / f'{name}.log'
+    return open(log_path, 'a', encoding='utf-8', buffering=1)
+
+
 def _flush_log(proc: subprocess.Popen | None, name: str, log_dir: Path) -> None:
     if proc is None or proc.stdout is None:
         return
@@ -140,6 +147,7 @@ def _start_vllm(
     gpu_ids: str = '0,1',
     served_model_name: str | None = None,
     tp: int = 2,
+    log_dir: Path | None = None,
 ) -> subprocess.Popen:
     """Start vLLM with TP and LoRA hot-loading enabled."""
     env = os.environ.copy()
@@ -161,12 +169,12 @@ def _start_vllm(
         '--gpu-memory-utilization', '0.85',
     ]
     log.info('[1a/5] Starting vLLM (TP=%d, LoRA=on) on GPU [%s], port %d ...', tp, gpu_ids, port)
+    log_file = _open_log_file('vllm', log_dir) if log_dir else None
     return subprocess.Popen(
         cmd,
         env=env,
-        stdout=subprocess.PIPE,
+        stdout=log_file,
         stderr=subprocess.STDOUT,
-        text=True,
     )
 
 
@@ -176,6 +184,7 @@ def _start_judge_vllm(
     gpu_ids: str = '4,5,6,7',
     served_model_name: str | None = None,
     tp: int = 4,
+    log_dir: Path | None = None,
 ) -> subprocess.Popen:
     """Start a dedicated vLLM instance for LLM-as-Judge (Qwen3-32B, TP=4)."""
     env = os.environ.copy()
@@ -193,12 +202,12 @@ def _start_judge_vllm(
         '--max-num-seqs', '16',
     ]
     log.info('[1b/5] Starting Judge vLLM (TP=%d) on GPU [%s], port %d ...', tp, gpu_ids, port)
+    log_file = _open_log_file('judge_vllm', log_dir) if log_dir else None
     return subprocess.Popen(
         cmd,
         env=env,
-        stdout=subprocess.PIPE,
+        stdout=log_file,
         stderr=subprocess.STDOUT,
-        text=True,
     )
 
 
@@ -212,6 +221,7 @@ def _start_gateway(
     port: int,
     mode: str = 'judge_log',
     rollout_batch_size: int = 8,
+    log_dir: Path | None = None,
 ) -> subprocess.Popen:
     """Start agent-online-rl Gateway (new architecture).
 
@@ -232,23 +242,22 @@ def _start_gateway(
     if lora_repo_root:
         env['LORA_REPO_ROOT'] = lora_repo_root
 
-    #TODO 子进程不合适，考虑单独拉起
     cmd = [
         sys.executable, '-m', 'uvicorn',
         'gateway.proxy:create_app',
         '--factory',
-        '--host', '0.0.0.0', #TODO 应该可配置
+        '--host', '0.0.0.0',
         '--port', str(port),
         '--log-level', 'info',
     ]
     log.info('[2/5] Starting Gateway on port %d (mode=%s) ...', port, mode)
+    log_file = _open_log_file('gateway', log_dir) if log_dir else None
     return subprocess.Popen(
         cmd,
         cwd=str(AGENT_ONLINE_RL),
         env=env,
-        stdout=subprocess.PIPE,
+        stdout=log_file,
         stderr=subprocess.STDOUT,
-        text=True,
     )
 
 
@@ -494,6 +503,7 @@ def main() -> None:
             vllm_proc = _start_vllm(
                 args.model_path, args.vllm_port,
                 gpu_ids=args.vllm_gpu, served_model_name=args.model_name, tp=args.vllm_tp,
+                log_dir=log_dir,
             )
         else:
             log.info('[1a/5] Using existing inference at %s', inference_url)
@@ -503,6 +513,7 @@ def main() -> None:
             judge_proc = _start_judge_vllm(
                 args.judge_model_path, args.judge_port,
                 gpu_ids=args.judge_gpu, served_model_name=args.judge_model_name, tp=args.judge_tp,
+                log_dir=log_dir,
             )
         else:
             log.info('[1b/5] Using existing Judge at %s', judge_url)
@@ -533,6 +544,7 @@ def main() -> None:
             port=args.gateway_port,
             mode=args.gateway_mode,
             rollout_batch_size=args.rollout_batch_size,
+            log_dir=log_dir,
         )
         _wait_for_health(f'{gateway_base_url}/health', timeout=30.0)
         log.info('  Gateway ready at port %d', args.gateway_port)

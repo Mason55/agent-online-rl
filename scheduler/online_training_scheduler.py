@@ -71,6 +71,7 @@ class OnlineTrainingScheduler:
         self._stop_event = threading.Event()
         self._accumulated_samples: list[dict[str, Any]] = []
         self._training_count = 0
+        self._http_client: Optional[httpx.Client] = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -91,12 +92,17 @@ class OnlineTrainingScheduler:
         logger.info("OnlineTrainingScheduler stopped (accumulated=%d)", len(self._accumulated_samples))
 
     def _poll_loop(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                self._poll_once()
-            except Exception:
-                logger.exception("Error in online training scheduler poll")
-            self._stop_event.wait(self.poll_interval)
+        self._http_client = httpx.Client(timeout=30)
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    self._poll_once()
+                except Exception:
+                    logger.exception("Error in online training scheduler poll")
+                self._stop_event.wait(self.poll_interval)
+        finally:
+            self._http_client.close()
+            self._http_client = None
 
     def _poll_once(self) -> None:
         """Pull batches from gateway and accumulate samples."""
@@ -105,14 +111,13 @@ class OnlineTrainingScheduler:
             headers["Authorization"] = f"Bearer {self.gateway_api_key}"
 
         try:
-            with httpx.Client(timeout=30) as client:
-                resp = client.post(
-                    f"{self.gateway_url}/v1/gateway/training_queue/pop",
-                    json={"max_batches": 10},
-                    headers=headers,
-                )
-                resp.raise_for_status()
-                data = resp.json()
+            resp = self._http_client.post(
+                f"{self.gateway_url}/v1/gateway/training_queue/pop",
+                json={"max_batches": 10},
+                headers=headers,
+            )
+            resp.raise_for_status()
+            data = resp.json()
         except Exception as exc:
             logger.debug("Failed to poll gateway queue: %s", exc)
             return
