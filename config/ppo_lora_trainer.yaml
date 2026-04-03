@@ -15,7 +15,7 @@ defaults:
 data:
   train_files: ???
   val_files: null
-  train_batch_size: 4
+  train_batch_size: 2
   micro_batch_size_per_gpu: 1
   max_token_len_per_gpu: 8192
   use_dynamic_bsz: false
