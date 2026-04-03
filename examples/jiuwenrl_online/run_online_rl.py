@@ -400,7 +400,26 @@ def main() -> None:
         '--judge-url', default=None,
         help='跳过 Judge vLLM 启动，直接连接已有 Judge 服务',
     )
+    parser.add_argument(
+        '--demo', action='store_true',
+        help='演示模式：极低阈值快速看到 LoRA 产出 (batch=2, threshold=2, scan=5s, judge_output)',
+    )
     args = parser.parse_args()
+
+    if args.demo:
+        args.rollout_batch_size = min(args.rollout_batch_size, 2)
+        args.threshold = min(args.threshold, 2)
+        args.scan_interval = min(args.scan_interval, 5)
+        args.gateway_mode = 'judge_output'
+        log.info('Demo mode: batch=%d threshold=%d scan=%ds mode=%s',
+                 args.rollout_batch_size, args.threshold, args.scan_interval, args.gateway_mode)
+
+    # If judge uses the same model path as inference but user forgot to align model name,
+    # auto-fix to prevent Judge 404 errors.
+    if args.judge_model_path == args.model_path and args.judge_model_name != args.model_name:
+        log.warning('Judge model path == inference model path, auto-aligning judge_model_name: %s -> %s',
+                     args.judge_model_name, args.model_name)
+        args.judge_model_name = args.model_name
 
     script_dir = Path(__file__).resolve().parent
     log_dir = script_dir / 'logs'
@@ -423,7 +442,10 @@ def main() -> None:
     else:
         judge_url = inference_url
         skip_judge = True
-        log.info('Judge will reuse inference vLLM (%s)', args.model_name)
+        # When reusing inference vLLM as Judge, the judge_model_name MUST match
+        # the inference served-model-name, otherwise Judge requests will 404.
+        args.judge_model_name = args.model_name
+        log.info('Judge will reuse inference vLLM (model=%s)', args.model_name)
 
     # Pre-flight: ensure ports are free
     ports_to_check = [('Gateway', args.gateway_port)]
@@ -539,9 +561,13 @@ def main() -> None:
 
         # ---- Ready ----
         has_web = web_proc is not None
+        # Delayed reward: Turn N scores at Turn N+1, so N turns → N-1 scored samples.
+        # Need rollout_batch_size scored samples to emit a batch, threshold to train.
+        est_turns = max(args.rollout_batch_size, args.threshold) + 1
+        demo_tag = ' [DEMO 演示模式]' if getattr(args, 'demo', False) else ''
         print()
         print('=' * 60)
-        print('  JiuwenClaw 在线 RL 闭环已启动 (v2: per-turn + Judge)')
+        print(f'  JiuwenClaw 在线 RL 闭环已启动{demo_tag}')
         print()
         if has_web:
             print(f'  Web 前端:        http://localhost:5173')
@@ -551,11 +577,13 @@ def main() -> None:
         print(f'  vLLM Judge:      {judge_url} ({judge_label})')
         print(f'  Gateway 代理:    {gateway_base_url}')
         print(f'  Gateway 模式:    {args.gateway_mode}')
-        print(f'  轨迹记录:        records/ (JSONL, per-turn)')
-        print(f'  LoRA 仓库:       {lora_repo}')
+        print(f'  Batch 大小:      {args.rollout_batch_size}')
         print(f'  训练阈值:        {args.threshold} 条样本')
         print(f'  扫描间隔:        {args.scan_interval} 秒')
         print(f'  训练 GPU:        [{args.train_gpu}]')
+        print(f'  LoRA 仓库:       {lora_repo}')
+        print()
+        print(f'  >>> 预计 {est_turns} 轮对话后触发首次 LoRA 训练 <<<')
         print()
         if has_web:
             print('  打开 http://localhost:5173 开始对话，')
@@ -564,6 +592,9 @@ def main() -> None:
         print('  每轮对话自动记录 token_ids + logprobs，')
         print('  下一轮到来时触发延迟 Judge 打分，')
         print('  样本累积达阈值后自动触发 LoRA 训练。')
+        if getattr(args, 'demo', False):
+            print()
+            print('  演示看板: bash demo_status.sh  (另开终端实时观察进度)')
         print('  按 Ctrl+C 停止所有服务。')
         print('=' * 60)
         print()
